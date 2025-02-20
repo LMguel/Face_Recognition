@@ -1,32 +1,46 @@
-import os
-import cv2
-import csv
-import datetime
 from flask import Flask, request, jsonify
+import cv2
+import os
+import face_recognition
+import numpy as np
+import datetime
+import pickle
 
 app = Flask(__name__)
 
-KNOWN_FACES_DIR = "known_faces"
-RECORDS_FILE = "records.csv"
-os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
+# Diretórios
+IMAGE_DIR = "capturas"
+ENCODINGS_FILE = "face_encodings.pkl"
 
-# Garante que o arquivo CSV tem os cabeçalhos corretos
-if not os.path.exists(RECORDS_FILE):
-    with open(RECORDS_FILE, mode='w', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow(["name", "date", "time"])
+# Criar diretórios se não existirem
+if not os.path.exists(IMAGE_DIR):
+    os.makedirs(IMAGE_DIR)
 
-@app.route('/capture', methods=['POST'])
-def capture_photo():
-    """ Captura uma foto automaticamente e salva no sistema. """
-    name = request.args.get('name')
+# Carregar dados salvos
+if os.path.exists(ENCODINGS_FILE):
+    with open(ENCODINGS_FILE, "rb") as f:
+        known_faces = pickle.load(f)
+else:
+    known_faces = {}
 
-    if not name:
+# 📌 1️⃣ Cadastro de funcionário (salvar rosto)
+@app.route('/register', methods=['POST'])
+def register():
+    """ Captura a foto do funcionário e armazena a assinatura facial """
+    data = request.get_json()
+
+    if not data or "nome" not in data:
         return jsonify({"error": "Nome do funcionário é obrigatório"}), 400
 
+    nome = data["nome"]
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{nome}_{timestamp}.jpg"
+    filepath = os.path.join(IMAGE_DIR, filename)
+
+    # Captura a imagem da webcam
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        return jsonify({"error": "Não foi possível acessar a câmera"}), 500
+        return jsonify({"error": "Erro ao acessar a webcam"}), 500
 
     ret, frame = cap.read()
     cap.release()
@@ -34,47 +48,69 @@ def capture_photo():
     if not ret:
         return jsonify({"error": "Erro ao capturar imagem"}), 500
 
-    file_path = os.path.join(KNOWN_FACES_DIR, f"{name}.jpg")
-    cv2.imwrite(file_path, frame)
+    # Salvar a imagem
+    cv2.imwrite(filepath, frame)
 
-    return jsonify({"message": f"Foto de {name} cadastrada com sucesso!", "file": file_path}), 200
+    # Analisar a imagem para extrair o rosto
+    face_encoding = extract_face_encoding(filepath)
+    if face_encoding is None:
+        return jsonify({"error": "Nenhum rosto detectado"}), 400
 
-@app.route('/register', methods=['POST'])
-def register_face():
-    """ Registra um novo ponto enviando uma imagem. """
-    if 'file' not in request.files:
-        return jsonify({"error": "Nenhuma imagem enviada"}), 400
+    # Armazena no banco de dados (dicionário + arquivo)
+    known_faces[nome] = face_encoding
+    with open(ENCODINGS_FILE, "wb") as f:
+        pickle.dump(known_faces, f)
 
-    file = request.files['file']
-    name = os.path.splitext(file.filename)[0]
+    return jsonify({"message": f"Funcionário {nome} cadastrado com sucesso!", "file": filename})
 
-    now = datetime.datetime.now()
-    date = now.strftime("%Y-%m-%d")
-    time = now.strftime("%H:%M:%S")
 
-    with open(RECORDS_FILE, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow([name, date, time])
+# 📌 2️⃣ Reconhecimento facial e registro de ponto
+@app.route('/recognize', methods=['POST'])
+def recognize():
+    """ Captura uma nova foto e verifica se o rosto é reconhecido """
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        return jsonify({"error": "Erro ao acessar a webcam"}), 500
 
-    return jsonify({"results": [{"name": name, "date": date, "time": time}]}), 200
+    ret, frame = cap.read()
+    cap.release()
 
-@app.route('/records', methods=['GET'])
-def get_records():
-    """ Retorna os registros de ponto. """
-    records = []
-    try:
-        with open(RECORDS_FILE, mode='r') as file:
-            reader = csv.DictReader(file)
-            for row in reader:
-                records.append({
-                    "name": row.get("name", "Nome não disponível"),
-                    "date": row.get("date", "Data não disponível"),
-                    "time": row.get("time", "Horário não disponível")
-                })
-    except Exception as e:
-        return jsonify({"error": f"Erro ao ler registros: {str(e)}"}), 500
+    if not ret:
+        return jsonify({"error": "Erro ao capturar imagem"}), 500
 
-    return jsonify({"records": records}), 200
+    # Salvar temporariamente
+    temp_filepath = os.path.join(IMAGE_DIR, "temp.jpg")
+    cv2.imwrite(temp_filepath, frame)
+
+    # Extrair o rosto da nova foto
+    unknown_encoding = extract_face_encoding(temp_filepath)
+    if unknown_encoding is None:
+        return jsonify({"error": "Nenhum rosto detectado"}), 400
+
+    # Comparar com os rostos cadastrados
+    for nome, known_encoding in known_faces.items():
+        results = face_recognition.compare_faces([known_encoding], unknown_encoding)
+        if results[0]:  # Se houver correspondência
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            return jsonify({"message": f"Registro de ponto bem-sucedido!", "funcionario": nome, "horario": timestamp})
+
+    return jsonify({"error": "Rosto não reconhecido"}), 404
+
+
+# 📌 Função auxiliar: Extrair assinatura facial
+def extract_face_encoding(image_path):
+    """ Lê a imagem e retorna a assinatura facial (encoding) """
+    image = face_recognition.load_image_file(image_path)
+    encodings = face_recognition.face_encodings(image)
+    if len(encodings) > 0:
+        return encodings[0]  # Retorna apenas o primeiro rosto encontrado
+    return None
+
+
+@app.route('/', methods=['GET'])
+def home():
+    return "API de Registro de Ponto Eletrônico com Reconhecimento Facial", 200
+
 
 if __name__ == '__main__':
     app.run(debug=True)
