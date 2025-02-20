@@ -1,91 +1,80 @@
-from flask import Flask, request, jsonify
-import face_recognition
-import cv2
-import numpy as np
 import os
+import cv2
+import csv
 import datetime
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Listas para armazenar os encodings e os nomes dos funcionários conhecidos.
-known_face_encodings = []
-known_face_names = []
+KNOWN_FACES_DIR = "known_faces"
+RECORDS_FILE = "records.csv"
+os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
 
-def load_known_faces(directory="known_faces"):
-    """
-    Carrega imagens dos funcionários conhecidos, calcula seus encodings e armazena
-    os resultados em listas.
-    """
-    for filename in os.listdir(directory):
-        if filename.lower().endswith((".jpg", ".png", ".jpeg")):
-            image_path = os.path.join(directory, filename)
-            image = face_recognition.load_image_file(image_path)
-            encodings = face_recognition.face_encodings(image)
-            if encodings:
-                known_face_encodings.append(encodings[0])
-                # O nome do funcionário é extraído do nome do arquivo (sem extensão)
-                name = os.path.splitext(filename)[0]
-                known_face_names.append(name)
-    print(f"Carregado {len(known_face_names)} funcionários conhecidos.")
+# Garante que o arquivo CSV tem os cabeçalhos corretos
+if not os.path.exists(RECORDS_FILE):
+    with open(RECORDS_FILE, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["name", "date", "time"])
 
-# Carregar os dados dos funcionários conhecidos assim que a API iniciar.
-load_known_faces()
+@app.route('/capture', methods=['POST'])
+def capture_photo():
+    """ Captura uma foto automaticamente e salva no sistema. """
+    name = request.args.get('name')
 
-# Rota raiz para informar que a API está rodando
-@app.route('/')
-def home():
-    return jsonify({"message": "API de registro de ponto está rodando. Use o endpoint /register para enviar uma imagem."}), 200
+    if not name:
+        return jsonify({"error": "Nome do funcionário é obrigatório"}), 400
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        return jsonify({"error": "Não foi possível acessar a câmera"}), 500
+
+    ret, frame = cap.read()
+    cap.release()
+
+    if not ret:
+        return jsonify({"error": "Erro ao capturar imagem"}), 500
+
+    file_path = os.path.join(KNOWN_FACES_DIR, f"{name}.jpg")
+    cv2.imwrite(file_path, frame)
+
+    return jsonify({"message": f"Foto de {name} cadastrada com sucesso!", "file": file_path}), 200
 
 @app.route('/register', methods=['POST'])
-def register_attendance():
-    """
-    Endpoint para registrar o ponto. Espera um arquivo de imagem enviado via POST.
-    O fluxo é:
-      1. Receber a imagem.
-      2. Converter a imagem para um array do OpenCV.
-      3. Detectar faces e calcular encodings.
-      4. Comparar com os encodings conhecidos.
-      5. Retornar o(s) nome(s) detectado(s) e o timestamp.
-    """
+def register_face():
+    """ Registra um novo ponto enviando uma imagem. """
     if 'file' not in request.files:
-        return jsonify({"error": "Nenhum arquivo enviado."}), 400
+        return jsonify({"error": "Nenhuma imagem enviada"}), 400
 
     file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "Nenhum arquivo selecionado."}), 400
+    name = os.path.splitext(file.filename)[0]
 
-    # Lê o arquivo e converte para array numpy
-    file_bytes = file.read()
-    np_arr = np.frombuffer(file_bytes, np.uint8)
-    image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    now = datetime.datetime.now()
+    date = now.strftime("%Y-%m-%d")
+    time = now.strftime("%H:%M:%S")
 
-    # Detecta as localizações e os encodings das faces na imagem
-    face_locations = face_recognition.face_locations(rgb_image)
-    face_encodings = face_recognition.face_encodings(rgb_image, face_locations)
+    with open(RECORDS_FILE, mode='a', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow([name, date, time])
 
-    results = []
-    timestamp = datetime.datetime.now().isoformat()
+    return jsonify({"results": [{"name": name, "date": date, "time": time}]}), 200
 
-    for face_encoding in face_encodings:
-        # Compara o encoding detectado com os conhecidos
-        matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
-        name = "Desconhecido"
+@app.route('/records', methods=['GET'])
+def get_records():
+    """ Retorna os registros de ponto. """
+    records = []
+    try:
+        with open(RECORDS_FILE, mode='r') as file:
+            reader = csv.DictReader(file)
+            for row in reader:
+                records.append({
+                    "name": row.get("name", "Nome não disponível"),
+                    "date": row.get("date", "Data não disponível"),
+                    "time": row.get("time", "Horário não disponível")
+                })
+    except Exception as e:
+        return jsonify({"error": f"Erro ao ler registros: {str(e)}"}), 500
 
-        # Calcula as distâncias para encontrar a melhor correspondência
-        face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
-        best_match_index = np.argmin(face_distances)
-        if matches[best_match_index]:
-            name = known_face_names[best_match_index]
-
-        # Aqui você pode registrar a presença (ex: salvar em banco de dados)
-        results.append({
-            "name": name,
-            "timestamp": timestamp
-        })
-
-    return jsonify({"results": results}), 200
+    return jsonify({"records": records}), 200
 
 if __name__ == '__main__':
-    # Execute o app em debug durante o desenvolvimento.
     app.run(debug=True)
